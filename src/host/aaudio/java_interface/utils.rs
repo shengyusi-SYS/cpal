@@ -15,7 +15,7 @@ pub fn with_attached<F, R>(context: AndroidContext, closure: F) -> JResult<R>
 where
     for<'j> F: FnOnce(&mut Env<'j>, JObject<'j>) -> JResult<R>,
 {
-    let vm = unsafe { JavaVM::from_raw(context.vm().cast()) };
+    let vm = unsafe { JavaVM::from_raw(context.vm().cast()) }?;
     let raw_context = context.context() as jobject;
     vm.attach_current_thread(|env: &mut Env<'_>| {
         let context_obj = unsafe { JObject::from_raw(env, raw_context) };
