@@ -5,12 +5,12 @@
 use std::cmp;
 use std::convert::TryInto;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::vec::IntoIter as VecIntoIter;
 
 extern crate ndk;
 
-use convert::{stream_instant, to_stream_instant};
+use convert::{input_stream_instant, now_stream_instant, output_stream_instant};
 use java_interface::{AudioDeviceInfo, AudioManager};
 
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -300,14 +300,14 @@ where
     E: FnMut(StreamError) + Send + 'static,
 {
     let builder = configure_for_device(builder, device, config);
-    let created = Instant::now();
     let channel_count = config.channels as i32;
+    let sample_rate = config.sample_rate;
     let stream = builder
         .data_callback(Box::new(move |stream, data, num_frames| {
             let cb_info = InputCallbackInfo {
                 timestamp: InputStreamTimestamp {
-                    callback: to_stream_instant(created.elapsed()),
-                    capture: stream_instant(stream),
+                    callback: now_stream_instant(),
+                    capture: input_stream_instant(stream, sample_rate),
                 },
             };
             (data_callback)(
@@ -346,14 +346,14 @@ where
     E: FnMut(StreamError) + Send + 'static,
 {
     let builder = configure_for_device(builder, device, config);
-    let created = Instant::now();
     let channel_count = config.channels as i32;
+    let sample_rate = config.sample_rate;
     let stream = builder
         .data_callback(Box::new(move |stream, data, num_frames| {
             let cb_info = OutputCallbackInfo {
                 timestamp: OutputStreamTimestamp {
-                    callback: to_stream_instant(created.elapsed()),
-                    playback: stream_instant(stream),
+                    callback: now_stream_instant(),
+                    playback: output_stream_instant(stream, sample_rate),
                 },
             };
             (data_callback)(
