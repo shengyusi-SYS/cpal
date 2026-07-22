@@ -491,7 +491,7 @@ pub struct Data {
 
 pub use timestamp::{
     InputCallbackInfo, InputStreamTimestamp, OutputCallbackInfo, OutputStreamTimestamp,
-    StreamInstant,
+    OutputTimestampSource, StreamInstant,
 };
 
 impl SupportedStreamConfig {

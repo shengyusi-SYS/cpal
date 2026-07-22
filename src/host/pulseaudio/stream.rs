@@ -223,7 +223,7 @@ impl Stream {
             // equivalent to) `sample_spec.format`.
             let mut data = unsafe { Data::from_parts(buf.as_mut_ptr().cast(), n_samples, format) };
 
-            data_callback(&mut data, &OutputCallbackInfo { timestamp });
+            data_callback(&mut data, &OutputCallbackInfo::new(timestamp));
 
             // Notify the latency thread that audio was written, so it updates timing info.
             let (lock, cvar) = &*update_callback;

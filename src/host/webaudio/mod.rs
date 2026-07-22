@@ -419,7 +419,7 @@ impl DeviceTrait for Device {
                                     time_at_start_of_buffer + total_hw_latency_secs,
                                 );
                                 let timestamp = OutputStreamTimestamp { callback, playback };
-                                let info = OutputCallbackInfo { timestamp };
+                                let info = OutputCallbackInfo::new(timestamp);
                                 (data_callback.deref_mut())(&mut data, &info);
                             }
                             Err(_) => {

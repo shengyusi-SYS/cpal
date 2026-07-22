@@ -1414,7 +1414,7 @@ unsafe fn apply_output_callback_to_data<A, D>(
         callback: callback_instant,
         playback,
     };
-    let info = OutputCallbackInfo { timestamp };
+    let info = OutputCallbackInfo::new(timestamp);
     data_callback(&mut data, &info);
 }
 

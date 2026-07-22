@@ -401,7 +401,7 @@ impl DeviceTrait for Device {
                                 + (buffer_duration
                                     + Duration::from_secs_f64(total_output_latency_secs));
                             let timestamp = OutputStreamTimestamp { callback, playback };
-                            let info = OutputCallbackInfo { timestamp };
+                            let info = OutputCallbackInfo::new(timestamp);
                             (data_callback)(&mut data, &info);
                         },
                     ))

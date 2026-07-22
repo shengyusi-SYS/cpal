@@ -1205,7 +1205,7 @@ fn process_output(
         callback: callback_instant,
         playback,
     };
-    let info = OutputCallbackInfo { timestamp };
+    let info = OutputCallbackInfo::new(timestamp);
     data_callback(&mut data, &info);
 
     let mut frames_written = 0;

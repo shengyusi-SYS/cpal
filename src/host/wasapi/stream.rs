@@ -810,7 +810,7 @@ fn process_output(
         let mut data = Data::from_parts(data, len, stream.sample_format);
         let sample_rate = stream.config.sample_rate;
         let timestamp = output_timestamp(stream, frames_available, sample_rate)?;
-        let info = OutputCallbackInfo { timestamp };
+        let info = OutputCallbackInfo::new(timestamp);
         data_callback(&mut data, &info);
 
         render_client

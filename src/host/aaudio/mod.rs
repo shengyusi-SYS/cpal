@@ -418,6 +418,7 @@ where
     let mut rt_checked = false;
     #[cfg(feature = "realtime")]
     let error_callback_for_rt = error_callback.clone();
+    let mut last_device_presentation = None;
 
     let stream = builder
         .data_callback(Box::new(move |stream, data, num_frames| {
@@ -463,12 +464,23 @@ where
             }
 
             // Deliver audio data to user callback
-            let cb_info = OutputCallbackInfo {
-                timestamp: OutputStreamTimestamp {
-                    callback: now_stream_instant(),
-                    playback: output_stream_instant(stream, sample_rate),
+            let callback_instant = now_stream_instant();
+            let output_timestamp = output_stream_instant(
+                stream,
+                sample_rate,
+                last_device_presentation,
+                callback_instant,
+            );
+            if output_timestamp.source() == crate::OutputTimestampSource::DevicePresentation {
+                last_device_presentation = Some(output_timestamp.instant());
+            }
+            let cb_info = OutputCallbackInfo::new_with_timestamp_source(
+                OutputStreamTimestamp {
+                    callback: callback_instant,
+                    playback: output_timestamp.instant(),
                 },
-            };
+                output_timestamp.source(),
+            );
             (data_callback)(
                 &mut unsafe { Data::from_parts(data as *mut _, n_samples, sample_format) },
                 &cb_info,

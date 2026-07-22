@@ -483,7 +483,7 @@ impl jack::ProcessHandler for LocalProcessHandler {
                 }
             };
             let timestamp = OutputStreamTimestamp { callback, playback };
-            let info = OutputCallbackInfo { timestamp };
+            let info = OutputCallbackInfo::new(timestamp);
             output_callback(&mut data, &info);
 
             // Deinterlace

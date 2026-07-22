@@ -18,7 +18,8 @@ use std::time::Duration;
 ///
 /// | Host | Time source |
 /// | ---- | ----------- |
-/// | AAudio | `AAudioStream_getTimestamp(CLOCK_MONOTONIC)` |
+/// | AAudio | `AAudioStream_getTimestamp(CLOCK_MONOTONIC)` when valid; otherwise the callback's
+///   monotonic instant (inspect [`OutputCallbackInfo::timestamp_source`]) |
 /// | ALSA | `snd_pcm_status_get_htstamp()` |
 /// | ASIO | `timeGetTime()` |
 /// | AudioWorklet | `AudioContext.currentTime` |
@@ -62,6 +63,110 @@ pub struct OutputStreamTimestamp {
     pub playback: StreamInstant,
 }
 
+/// Identifies how an output callback's playback timestamp was obtained.
+///
+/// This classification is paired with the timestamp for one callback. It does not describe
+/// whether the timestamp is valid or monotonic; hosts must handle those conditions separately.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum OutputTimestampSource {
+    /// The host reported the device presentation time for the callback's first frame.
+    DevicePresentation,
+    /// The host could not provide a device presentation time and used its monotonic clock.
+    MonotonicFallback,
+    /// The host does not expose a stable provenance classification.
+    Unspecified,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OutputTimestampFallbackReason {
+    Unavailable,
+    Unsupported,
+    Invalid,
+    NonMonotonic,
+    ClockDomainMismatch,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutputTimestampMapping {
+    instant: StreamInstant,
+    source: OutputTimestampSource,
+    fallback_reason: Option<OutputTimestampFallbackReason>,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl OutputTimestampMapping {
+    pub(crate) fn instant(self) -> StreamInstant {
+        self.instant
+    }
+
+    pub(crate) fn source(self) -> OutputTimestampSource {
+        self.source
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn stream_instant_from_anchor(
+    anchor_frame: i64,
+    anchor_nanos: i64,
+    app_frame: i64,
+    sample_rate: u32,
+) -> Option<StreamInstant> {
+    if anchor_nanos < 0 || sample_rate == 0 {
+        return None;
+    }
+    let frame_delta = (app_frame as i128).checked_sub(anchor_frame as i128)?;
+    let offset_nanos = frame_delta
+        .checked_mul(1_000_000_000)?
+        .checked_div(sample_rate as i128)?;
+    let projected_nanos = (anchor_nanos as i128).checked_add(offset_nanos)?;
+    let projected_nanos = u64::try_from(projected_nanos).ok()?;
+    Some(StreamInstant::from_nanos(projected_nanos))
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn map_output_timestamp(
+    anchor: Result<(i64, i64), OutputTimestampFallbackReason>,
+    app_frame: i64,
+    sample_rate: u32,
+    monotonic_domain: bool,
+    last_device_presentation: Option<StreamInstant>,
+    fallback: StreamInstant,
+) -> OutputTimestampMapping {
+    let device_presentation = if !monotonic_domain {
+        Err(OutputTimestampFallbackReason::ClockDomainMismatch)
+    } else {
+        anchor
+            .and_then(|(anchor_frame, anchor_nanos)| {
+                stream_instant_from_anchor(anchor_frame, anchor_nanos, app_frame, sample_rate)
+                    .ok_or(OutputTimestampFallbackReason::Invalid)
+            })
+            .and_then(|instant| {
+                if instant < fallback {
+                    Err(OutputTimestampFallbackReason::Invalid)
+                } else if last_device_presentation.is_some_and(|last| instant <= last) {
+                    Err(OutputTimestampFallbackReason::NonMonotonic)
+                } else {
+                    Ok(instant)
+                }
+            })
+    };
+
+    match device_presentation {
+        Ok(instant) => OutputTimestampMapping {
+            instant,
+            source: OutputTimestampSource::DevicePresentation,
+            fallback_reason: None,
+        },
+        Err(fallback_reason) => OutputTimestampMapping {
+            instant: fallback,
+            source: OutputTimestampSource::MonotonicFallback,
+            fallback_reason: Some(fallback_reason),
+        },
+    }
+}
+
 /// Information relevant to a single call to the user's input stream data callback.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct InputCallbackInfo {
@@ -72,6 +177,7 @@ pub struct InputCallbackInfo {
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OutputCallbackInfo {
     pub(crate) timestamp: OutputStreamTimestamp,
+    pub(crate) timestamp_source: OutputTimestampSource,
 }
 
 impl StreamInstant {
@@ -255,12 +361,31 @@ impl InputCallbackInfo {
 
 impl OutputCallbackInfo {
     pub fn new(timestamp: OutputStreamTimestamp) -> Self {
-        Self { timestamp }
+        Self {
+            timestamp,
+            timestamp_source: OutputTimestampSource::Unspecified,
+        }
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn new_with_timestamp_source(
+        timestamp: OutputStreamTimestamp,
+        timestamp_source: OutputTimestampSource,
+    ) -> Self {
+        Self {
+            timestamp,
+            timestamp_source,
+        }
     }
 
     /// The timestamp associated with the call to an output stream's data callback.
     pub fn timestamp(&self) -> OutputStreamTimestamp {
         self.timestamp
+    }
+
+    /// Returns the provenance of this callback's playback timestamp.
+    pub fn timestamp_source(&self) -> OutputTimestampSource {
+        self.timestamp_source
     }
 }
 
@@ -325,6 +450,95 @@ mod tests {
             StreamInstant::new(1, 500_000_000)
         );
         assert_eq!(StreamInstant::from_secs_f64(0.0), z);
+    }
+
+    #[test]
+    fn output_timestamp_source_is_paired_with_callback_info() {
+        let timestamp = OutputStreamTimestamp {
+            callback: StreamInstant::from_millis(10),
+            playback: StreamInstant::from_millis(20),
+        };
+
+        let unspecified = OutputCallbackInfo::new(timestamp);
+        assert_eq!(
+            unspecified.timestamp_source(),
+            OutputTimestampSource::Unspecified
+        );
+
+        let device = OutputCallbackInfo::new_with_timestamp_source(
+            timestamp,
+            OutputTimestampSource::DevicePresentation,
+        );
+        assert_eq!(device.timestamp(), timestamp);
+        assert_eq!(
+            device.timestamp_source(),
+            OutputTimestampSource::DevicePresentation
+        );
+
+        let fallback = OutputCallbackInfo::new_with_timestamp_source(
+            timestamp,
+            OutputTimestampSource::MonotonicFallback,
+        );
+        assert_eq!(fallback.timestamp(), timestamp);
+        assert_eq!(
+            fallback.timestamp_source(),
+            OutputTimestampSource::MonotonicFallback
+        );
+    }
+
+    #[test]
+    fn output_timestamp_mapping_classifies_device_and_fallback_outcomes() {
+        let fallback = StreamInstant::from_millis(99);
+        let device =
+            map_output_timestamp(Ok((100, 1_000_000_000)), 148, 48_000, true, None, fallback);
+        assert_eq!(device.instant(), StreamInstant::from_millis(1_001));
+        assert_eq!(device.source(), OutputTimestampSource::DevicePresentation);
+        assert_eq!(device.fallback_reason, None);
+
+        for (anchor, monotonic_domain, last, reason) in [
+            (
+                Err(OutputTimestampFallbackReason::Unavailable),
+                true,
+                None,
+                OutputTimestampFallbackReason::Unavailable,
+            ),
+            (
+                Err(OutputTimestampFallbackReason::Unsupported),
+                true,
+                None,
+                OutputTimestampFallbackReason::Unsupported,
+            ),
+            (
+                Ok((0, -1)),
+                true,
+                None,
+                OutputTimestampFallbackReason::Invalid,
+            ),
+            (
+                Ok((0, 50_000_000)),
+                true,
+                Some(StreamInstant::from_millis(40)),
+                OutputTimestampFallbackReason::Invalid,
+            ),
+            (
+                Ok((100, 1_000_000_000)),
+                true,
+                Some(StreamInstant::from_millis(1_001)),
+                OutputTimestampFallbackReason::NonMonotonic,
+            ),
+            (
+                Ok((100, 1_000_000_000)),
+                false,
+                None,
+                OutputTimestampFallbackReason::ClockDomainMismatch,
+            ),
+        ] {
+            let mapped =
+                map_output_timestamp(anchor, 148, 48_000, monotonic_domain, last, fallback);
+            assert_eq!(mapped.instant(), fallback);
+            assert_eq!(mapped.source(), OutputTimestampSource::MonotonicFallback);
+            assert_eq!(mapped.fallback_reason, Some(reason));
+        }
     }
 
     #[test]

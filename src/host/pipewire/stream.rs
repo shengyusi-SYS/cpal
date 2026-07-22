@@ -333,7 +333,7 @@ where
             }
         };
         let timestamp = OutputStreamTimestamp { callback, playback };
-        let info = OutputCallbackInfo { timestamp };
+        let info = OutputCallbackInfo::new(timestamp);
         (self.data_callback)(data, &info);
     }
 }

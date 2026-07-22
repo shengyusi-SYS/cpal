@@ -897,7 +897,7 @@ impl Device {
             let playback = callback + delay;
             let timestamp = OutputStreamTimestamp { callback, playback };
 
-            let info = OutputCallbackInfo { timestamp };
+            let info = OutputCallbackInfo::new(timestamp);
             data_callback(&mut data, &info);
             Ok(())
         })?;

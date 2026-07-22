@@ -2,7 +2,13 @@
 
 extern crate ndk;
 
-use crate::{Error, ErrorKind, StreamInstant};
+use crate::{
+    timestamp::{
+        map_output_timestamp, stream_instant_from_anchor, OutputTimestampFallbackReason,
+        OutputTimestampMapping,
+    },
+    Error, ErrorKind, StreamInstant,
+};
 
 /// Returns a [`StreamInstant`] for the current moment.
 pub fn now_stream_instant() -> StreamInstant {
@@ -15,30 +21,29 @@ pub fn now_stream_instant() -> StreamInstant {
     StreamInstant::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
-/// Projects a hardware timestamp anchor to the instant of a specific frame position.
-fn stream_instant_from_anchor(
-    anchor_frame: i64,
-    anchor_nanos: i64,
-    app_frame: i64,
-    sample_rate: u32,
-) -> StreamInstant {
-    let offset_nanos =
-        (app_frame as i128 - anchor_frame as i128) * 1_000_000_000 / sample_rate as i128;
-    StreamInstant::from_nanos((anchor_nanos as i128 + offset_nanos).max(0) as u64)
-}
-
 /// Returns the [`StreamInstant`] for when the first frame of the current output callback will
 /// be presented at the DAC.
-pub fn output_stream_instant(stream: &ndk::audio::AudioStream, sample_rate: u32) -> StreamInstant {
-    match stream.timestamp(ndk::audio::Clockid::Monotonic) {
-        Ok(ts) => stream_instant_from_anchor(
-            ts.frame_position,
-            ts.time_nanoseconds,
-            stream.frames_written(),
-            sample_rate,
-        ),
-        Err(_) => now_stream_instant(),
-    }
+pub fn output_stream_instant(
+    stream: &ndk::audio::AudioStream,
+    sample_rate: u32,
+    last_device_presentation: Option<StreamInstant>,
+    fallback: StreamInstant,
+) -> OutputTimestampMapping {
+    let anchor = stream
+        .timestamp(ndk::audio::Clockid::Monotonic)
+        .map(|ts| (ts.frame_position, ts.time_nanoseconds))
+        .map_err(|error| match error {
+            ndk::audio::AudioError::Unimplemented => OutputTimestampFallbackReason::Unsupported,
+            _ => OutputTimestampFallbackReason::Unavailable,
+        });
+    map_output_timestamp(
+        anchor,
+        stream.frames_written(),
+        sample_rate,
+        true,
+        last_device_presentation,
+        fallback,
+    )
 }
 
 /// Returns the [`StreamInstant`] for when the first frame of the current input callback was
@@ -50,7 +55,8 @@ pub fn input_stream_instant(stream: &ndk::audio::AudioStream, sample_rate: u32) 
             ts.time_nanoseconds,
             stream.frames_read(),
             sample_rate,
-        ),
+        )
+        .unwrap_or_else(now_stream_instant),
         Err(_) => now_stream_instant(),
     }
 }
