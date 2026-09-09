@@ -978,19 +978,9 @@ impl Device {
                     })?;
                 let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
 
-                // Ensure the format is supported.
-                match super::device::is_format_supported(&audio_client, &format_attempt.Format) {
-                    Ok(false) => {
-                        return Err(Error::with_message(
-                            ErrorKind::UnsupportedConfig,
-                            "Stream configuration is not supported in shared mode",
-                        ))
-                    }
-                    Err(e) => return Err(e),
-                    _ => (),
-                }
-
-                // Finally, initializing the audio client
+                // IsFormatSupported only checks native shared-mode support. Output uses
+                // AUTOCONVERTPCM, so let Initialize validate the format with conversion
+                // enabled, as advertised by supported_output_configs.
                 audio_client
                     .Initialize(
                         share_mode,
