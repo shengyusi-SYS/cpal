@@ -4,7 +4,7 @@ extern crate ndk;
 
 use crate::{
     timestamp::{
-        map_output_timestamp, stream_instant_from_anchor, OutputTimestampFallbackReason,
+        stream_instant_from_anchor, OutputTimestampFallbackReason, OutputTimestampHistory,
         OutputTimestampMapping,
     },
     Error, ErrorKind, StreamInstant,
@@ -26,23 +26,25 @@ pub fn now_stream_instant() -> StreamInstant {
 pub fn output_stream_instant(
     stream: &ndk::audio::AudioStream,
     sample_rate: u32,
-    last_device_presentation: Option<StreamInstant>,
+    history: &mut OutputTimestampHistory,
     fallback: StreamInstant,
 ) -> OutputTimestampMapping {
-    let anchor = stream
-        .timestamp(ndk::audio::Clockid::Monotonic)
-        .map(|ts| (ts.frame_position, ts.time_nanoseconds))
-        .map_err(|error| match error {
-            ndk::audio::AudioError::Unimplemented => OutputTimestampFallbackReason::Unsupported,
-            _ => OutputTimestampFallbackReason::Unavailable,
-        });
-    map_output_timestamp(
+    let (anchor, query_error_code) = match stream.timestamp(ndk::audio::Clockid::Monotonic) {
+        Ok(ts) => (Ok((ts.frame_position, ts.time_nanoseconds)), None),
+        Err(error) => {
+            let reason = match error {
+                ndk::audio::AudioError::Unimplemented => OutputTimestampFallbackReason::Unsupported,
+                _ => OutputTimestampFallbackReason::Unavailable,
+            };
+            (Err(reason), Some(i32::from(error)))
+        }
+    };
+    history.observe(
         anchor,
         stream.frames_written(),
         sample_rate,
-        true,
-        last_device_presentation,
         fallback,
+        query_error_code,
     )
 }
 

@@ -77,9 +77,9 @@ pub enum OutputTimestampSource {
     Unspecified,
 }
 
-#[cfg(any(target_os = "android", test))]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum OutputTimestampFallbackReason {
+/// Why the host could not supply a usable device presentation timestamp.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum OutputTimestampFallbackReason {
     Unavailable,
     Unsupported,
     Invalid,
@@ -87,12 +87,93 @@ pub(crate) enum OutputTimestampFallbackReason {
     ClockDomainMismatch,
 }
 
+/// Fixed-size evidence for one host timestamp query. Deltas contain no clock origins.
+/// This is diagnostic information, not an additional timestamp validity contract.
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct OutputTimestampDiagnostics {
+    /// Rejection category, absent for accepted device timestamps.
+    pub fallback_reason: Option<OutputTimestampFallbackReason>,
+    /// Native query error code, absent when the query succeeded.
+    pub query_error_code: Option<i32>,
+    /// Frame-position change since the previous successful raw query.
+    pub anchor_frame_delta: Option<i64>,
+    /// Time change since the previous successful raw query, in nanoseconds.
+    pub anchor_time_delta_ns: Option<i64>,
+    /// Application frame-position change since the previous callback.
+    pub app_frame_delta: Option<i64>,
+    /// Projected presentation minus this callback's monotonic time, in nanoseconds.
+    pub projected_ahead_ns: Option<i64>,
+    /// Projected presentation minus the last accepted presentation, in nanoseconds.
+    pub projected_step_ns: Option<i64>,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Default)]
+pub(crate) struct OutputTimestampHistory {
+    last_device_presentation: Option<StreamInstant>,
+    previous_anchor: Option<(i64, i64)>,
+    previous_app_frame: Option<i64>,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl OutputTimestampHistory {
+    pub(crate) fn observe(
+        &mut self,
+        anchor: Result<(i64, i64), OutputTimestampFallbackReason>,
+        app_frame: i64,
+        sample_rate: u32,
+        fallback: StreamInstant,
+        query_error_code: Option<i32>,
+    ) -> OutputTimestampMapping {
+        let mut mapped = map_output_timestamp(
+            anchor,
+            app_frame,
+            sample_rate,
+            true,
+            self.last_device_presentation,
+            fallback,
+        );
+        let mut diagnostics = OutputTimestampDiagnostics {
+            fallback_reason: mapped.diagnostics.fallback_reason,
+            query_error_code,
+            app_frame_delta: self
+                .previous_app_frame
+                .and_then(|previous| app_frame.checked_sub(previous)),
+            ..Default::default()
+        };
+        if let Ok((frame, nanos)) = anchor {
+            if let Some((previous_frame, previous_nanos)) = self.previous_anchor {
+                diagnostics.anchor_frame_delta = frame.checked_sub(previous_frame);
+                diagnostics.anchor_time_delta_ns = nanos.checked_sub(previous_nanos);
+            }
+            if let Some(projected) =
+                stream_instant_from_anchor(frame, nanos, app_frame, sample_rate)
+            {
+                let delta = |earlier: StreamInstant| {
+                    i64::try_from(projected.as_nanos() as i128 - earlier.as_nanos() as i128).ok()
+                };
+                diagnostics.projected_ahead_ns = delta(fallback);
+                diagnostics.projected_step_ns = self.last_device_presentation.and_then(delta);
+            }
+            // Raw-query history includes rejected projections, so the next event
+            // can distinguish anchor motion from the app-frame extrapolation.
+            self.previous_anchor = Some((frame, nanos));
+        }
+        self.previous_app_frame = Some(app_frame);
+        mapped.diagnostics = diagnostics;
+        if mapped.source == OutputTimestampSource::DevicePresentation {
+            self.last_device_presentation = Some(mapped.instant);
+        }
+        mapped
+    }
+}
+
 #[cfg(any(target_os = "android", test))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OutputTimestampMapping {
     instant: StreamInstant,
     source: OutputTimestampSource,
-    fallback_reason: Option<OutputTimestampFallbackReason>,
+    diagnostics: OutputTimestampDiagnostics,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -103,6 +184,10 @@ impl OutputTimestampMapping {
 
     pub(crate) fn source(self) -> OutputTimestampSource {
         self.source
+    }
+
+    pub(crate) fn diagnostics(self) -> OutputTimestampDiagnostics {
+        self.diagnostics
     }
 }
 
@@ -157,12 +242,15 @@ pub(crate) fn map_output_timestamp(
         Ok(instant) => OutputTimestampMapping {
             instant,
             source: OutputTimestampSource::DevicePresentation,
-            fallback_reason: None,
+            diagnostics: OutputTimestampDiagnostics::default(),
         },
         Err(fallback_reason) => OutputTimestampMapping {
             instant: fallback,
             source: OutputTimestampSource::MonotonicFallback,
-            fallback_reason: Some(fallback_reason),
+            diagnostics: OutputTimestampDiagnostics {
+                fallback_reason: Some(fallback_reason),
+                ..Default::default()
+            },
         },
     }
 }
@@ -178,6 +266,7 @@ pub struct InputCallbackInfo {
 pub struct OutputCallbackInfo {
     pub(crate) timestamp: OutputStreamTimestamp,
     pub(crate) timestamp_source: OutputTimestampSource,
+    timestamp_diagnostics: Option<OutputTimestampDiagnostics>,
 }
 
 impl StreamInstant {
@@ -364,6 +453,7 @@ impl OutputCallbackInfo {
         Self {
             timestamp,
             timestamp_source: OutputTimestampSource::Unspecified,
+            timestamp_diagnostics: None,
         }
     }
 
@@ -375,7 +465,22 @@ impl OutputCallbackInfo {
         Self {
             timestamp,
             timestamp_source,
+            timestamp_diagnostics: None,
         }
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn with_timestamp_diagnostics(
+        mut self,
+        diagnostics: OutputTimestampDiagnostics,
+    ) -> Self {
+        self.timestamp_diagnostics = Some(diagnostics);
+        self
+    }
+
+    /// Host query evidence paired with this callback, if the host provides it.
+    pub fn timestamp_diagnostics(&self) -> Option<OutputTimestampDiagnostics> {
+        self.timestamp_diagnostics
     }
 
     /// The timestamp associated with the call to an output stream's data callback.
@@ -460,6 +565,7 @@ mod tests {
         };
 
         let unspecified = OutputCallbackInfo::new(timestamp);
+        assert_eq!(unspecified.timestamp_diagnostics(), None);
         assert_eq!(
             unspecified.timestamp_source(),
             OutputTimestampSource::Unspecified
@@ -487,13 +593,88 @@ mod tests {
     }
 
     #[test]
+    fn output_timestamp_diagnostics_distinguish_projection_rejection_and_query_error() {
+        let mut history = OutputTimestampHistory::default();
+        let first = history.observe(
+            Ok((0, 1_000_000_000)),
+            8_000,
+            48_000,
+            StreamInstant::from_millis(1_000),
+            None,
+        );
+        assert_eq!(first.source(), OutputTimestampSource::DevicePresentation);
+        // Both raw anchor coordinates advance, but the projected app frame regresses.
+        let rejected = history.observe(
+            Ok((960, 1_009_000_000)),
+            8_480,
+            48_000,
+            StreamInstant::from_millis(1_010),
+            None,
+        );
+        assert_eq!(rejected.source(), OutputTimestampSource::MonotonicFallback);
+        assert_eq!(
+            rejected.diagnostics.fallback_reason,
+            Some(OutputTimestampFallbackReason::NonMonotonic)
+        );
+        assert_eq!(rejected.diagnostics.anchor_frame_delta, Some(960));
+        assert_eq!(rejected.diagnostics.anchor_time_delta_ns, Some(9_000_000));
+        assert_eq!(rejected.diagnostics.app_frame_delta, Some(480));
+        assert_eq!(rejected.diagnostics.projected_step_ns, Some(-1_000_000));
+        assert_eq!(rejected.diagnostics.projected_ahead_ns, Some(155_666_666));
+        assert_eq!(rejected.diagnostics.query_error_code, None);
+        let info = OutputCallbackInfo::new_with_timestamp_source(
+            OutputStreamTimestamp {
+                callback: StreamInstant::from_millis(1_010),
+                playback: rejected.instant(),
+            },
+            rejected.source(),
+        )
+        .with_timestamp_diagnostics(rejected.diagnostics());
+        assert_eq!(info.timestamp_diagnostics(), Some(rejected.diagnostics()));
+        assert_eq!(
+            info.timestamp_source(),
+            OutputTimestampSource::MonotonicFallback
+        );
+        let missing = history.observe(
+            Err(OutputTimestampFallbackReason::Unavailable),
+            8_960,
+            48_000,
+            StreamInstant::from_millis(1_020),
+            Some(-899),
+        );
+        assert_eq!(missing.diagnostics.query_error_code, Some(-899));
+        assert_eq!(
+            missing.diagnostics.fallback_reason,
+            Some(OutputTimestampFallbackReason::Unavailable)
+        );
+        assert_eq!(missing.diagnostics.anchor_frame_delta, None);
+        assert_eq!(missing.diagnostics.projected_step_ns, None);
+        let recovered = history.observe(
+            Ok((1_920, 1_030_000_000)),
+            9_440,
+            48_000,
+            StreamInstant::from_millis(1_030),
+            None,
+        );
+        assert_eq!(
+            recovered.source(),
+            OutputTimestampSource::DevicePresentation
+        );
+        assert_eq!(recovered.diagnostics.fallback_reason, None);
+        assert_eq!(recovered.diagnostics.query_error_code, None);
+        assert_eq!(recovered.diagnostics.anchor_frame_delta, Some(960));
+        assert_eq!(recovered.diagnostics.app_frame_delta, Some(480));
+        assert_eq!(recovered.diagnostics.projected_step_ns, Some(20_000_000));
+    }
+
+    #[test]
     fn output_timestamp_mapping_classifies_device_and_fallback_outcomes() {
         let fallback = StreamInstant::from_millis(99);
         let device =
             map_output_timestamp(Ok((100, 1_000_000_000)), 148, 48_000, true, None, fallback);
         assert_eq!(device.instant(), StreamInstant::from_millis(1_001));
         assert_eq!(device.source(), OutputTimestampSource::DevicePresentation);
-        assert_eq!(device.fallback_reason, None);
+        assert_eq!(device.diagnostics.fallback_reason, None);
 
         for (anchor, monotonic_domain, last, reason) in [
             (
@@ -537,7 +718,7 @@ mod tests {
                 map_output_timestamp(anchor, 148, 48_000, monotonic_domain, last, fallback);
             assert_eq!(mapped.instant(), fallback);
             assert_eq!(mapped.source(), OutputTimestampSource::MonotonicFallback);
-            assert_eq!(mapped.fallback_reason, Some(reason));
+            assert_eq!(mapped.diagnostics.fallback_reason, Some(reason));
         }
     }
 
