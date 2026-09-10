@@ -471,6 +471,14 @@ where
                 &mut timestamp_history,
                 callback_instant,
             );
+            // Fixed-size context for diagnosing timeline gaps. Keep the existing
+            // post-callback buffer tuner independent of this observation.
+            let mut timestamp_diagnostics = output_timestamp.diagnostics();
+            timestamp_diagnostics.output_xrun_count = u32::try_from(stream.x_run_count()).ok();
+            timestamp_diagnostics.output_buffer_size_frames =
+                u32::try_from(stream.buffer_size_in_frames())
+                    .ok()
+                    .filter(|frames| *frames > 0);
             let cb_info = OutputCallbackInfo::new_with_timestamp_source(
                 OutputStreamTimestamp {
                     callback: callback_instant,
@@ -478,7 +486,7 @@ where
                 },
                 output_timestamp.source(),
             )
-            .with_timestamp_diagnostics(output_timestamp.diagnostics());
+            .with_timestamp_diagnostics(timestamp_diagnostics);
             (data_callback)(
                 &mut unsafe { Data::from_parts(data as *mut _, n_samples, sample_format) },
                 &cb_info,

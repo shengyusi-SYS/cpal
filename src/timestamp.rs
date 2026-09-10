@@ -87,7 +87,8 @@ pub enum OutputTimestampFallbackReason {
     ClockDomainMismatch,
 }
 
-/// Fixed-size evidence for one host timestamp query. Deltas contain no clock origins.
+/// Fixed-size evidence for one host timestamp query and its output buffer context.
+/// Deltas contain no clock origins.
 /// This is diagnostic information, not an additional timestamp validity contract.
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct OutputTimestampDiagnostics {
@@ -105,6 +106,11 @@ pub struct OutputTimestampDiagnostics {
     pub projected_ahead_ns: Option<i64>,
     /// Projected presentation minus the last accepted presentation, in nanoseconds.
     pub projected_step_ns: Option<i64>,
+    /// Backend's cumulative output underrun count before this callback, if available.
+    /// This does not count silence deliberately supplied by the application.
+    pub output_xrun_count: Option<u32>,
+    /// Backend's current output buffer size in frames, if available.
+    pub output_buffer_size_frames: Option<u32>,
 }
 
 #[cfg(any(target_os = "android", test))]
