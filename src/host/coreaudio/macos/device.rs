@@ -19,7 +19,8 @@ use coreaudio::audio_unit::{
     AudioUnit, Element, SampleFormat as CoreAudioSampleFormat, Scope, StreamFormat,
 };
 use objc2_audio_toolbox::{
-    kAudioOutputUnitProperty_CurrentDevice, kAudioUnitProperty_StreamFormat,
+    kAudioOutputUnitProperty_CurrentDevice, kAudioUnitProperty_Latency,
+    kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitProperty_StreamFormat,
 };
 use objc2_core_audio::{
     kAudioAggregateDeviceClassID, kAudioDevicePropertyAvailableNominalSampleRates,
@@ -27,14 +28,15 @@ use objc2_core_audio::{
     kAudioDevicePropertyDeviceUID, kAudioDevicePropertyLatency,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertySafetyOffset,
     kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyStreamFormat,
-    kAudioObjectPropertyClass, kAudioObjectPropertyElementMain, kAudioObjectPropertyElementMaster,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
-    kAudioObjectPropertyScopeOutput, AudioClassID, AudioDeviceID, AudioObjectGetPropertyData,
-    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectPropertyScope, AudioObjectSetPropertyData,
+    kAudioDevicePropertyStreams, kAudioObjectPropertyClass, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioStreamPropertyLatency,
+    AudioClassID, AudioDeviceID, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyScope,
+    AudioObjectSetPropertyData, AudioStreamID,
 };
 use objc2_core_audio_types::{
-    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioValueRange,
+    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioTimeStampFlags, AudioValueRange,
 };
 use objc2_core_foundation::{CFString, Type};
 
@@ -51,8 +53,8 @@ use crate::{
     traits::DeviceTrait,
     BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error,
     ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp, InterfaceType,
-    OutputCallbackInfo, OutputStreamTimestamp, ResultExt, SampleFormat, SampleRate, StreamConfig,
-    StreamInstant, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
+    OutputCallbackInfo, ResultExt, SampleFormat, SampleRate, StreamConfig, StreamInstant,
+    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
 };
 
 /// Try to find a matching physical stream format on the device and apply it.
@@ -864,8 +866,21 @@ impl Device {
 
         // Register the callback that is being called by coreaudio whenever it needs data to be
         // fed to the audio buffer.
-        let (bytes_per_channel, sample_rate, device_buffer_frames, extra_latency_frames) =
-            setup_callback_vars(&audio_unit, config, sample_format, Scope::Output);
+        let bytes_per_channel = sample_format.sample_size();
+        let hardware_latency =
+            get_output_hardware_latency(&audio_unit, self.audio_device_id, config.sample_rate).ok();
+        // Other streams may change this device-wide period while we are alive.
+        // Reserve for the advertised range before AudioUnit initialization.
+        if let SupportedBufferSize::Range { max, .. } =
+            get_io_buffer_frame_size_range(self.audio_device_id)?
+        {
+            audio_unit.set_property(
+                kAudioUnitProperty_MaximumFramesPerSlice,
+                Scope::Global,
+                Element::Output,
+                Some(&max),
+            )?;
+        }
 
         type Args = render_callback::Args<data::Raw>;
         audio_unit.set_render_callback(move |args: Args| unsafe {
@@ -882,7 +897,8 @@ impl Device {
             let len = data_byte_size as usize / bytes_per_channel;
             let mut data = Data::from_parts(data, len, sample_format);
 
-            let callback = match host_time_to_stream_instant(args.time_stamp.mHostTime) {
+            let callback = match host_time_to_stream_instant(mach2::mach_time::mach_absolute_time())
+            {
                 Err(err) => {
                     let _ = try_emit_error(&error_callback_for_render, err);
                     return Err(());
@@ -890,14 +906,20 @@ impl Device {
                 Ok(cb) => cb,
             };
             let buffer_frames = len / channels as usize;
-            // Use device buffer size for latency calculation if available
-            let latency_frames =
-                device_buffer_frames.unwrap_or(buffer_frames) + extra_latency_frames;
-            let delay = frames_to_duration(latency_frames as FrameCount, sample_rate);
-            let playback = callback + delay;
-            let timestamp = OutputStreamTimestamp { callback, playback };
-
-            let info = OutputCallbackInfo::new(timestamp);
+            // HAL's render host time already includes the IO-cycle lead and
+            // safety offset. Only downstream device/stream/unit latency is added.
+            let render_time = args
+                .time_stamp
+                .mFlags
+                .contains(AudioTimeStampFlags::HostTimeValid)
+                .then(|| host_time_to_stream_instant(args.time_stamp.mHostTime).ok())
+                .flatten();
+            let info = crate::timestamp::coreaudio_output_callback_info(
+                callback,
+                render_time,
+                hardware_latency,
+                buffer_frames as u32,
+            );
             data_callback(&mut data, &info);
             Ok(())
         })?;
@@ -926,6 +948,96 @@ impl Device {
         stream.signal_ready();
         Ok(stream)
     }
+}
+
+/// Non-RT setup: HAL host timestamps stop at the device boundary. Device and
+/// stream latency account for the remaining hardware path; unit latency includes
+/// any format conversion. Buffer duration and safety offset are already in HAL time.
+fn get_output_hardware_latency(
+    audio_unit: &AudioUnit,
+    device_id: AudioDeviceID,
+    sample_rate: SampleRate,
+) -> Result<Duration, Error> {
+    fn property(
+        object: AudioObjectID,
+        selector: u32,
+        scope: AudioObjectPropertyScope,
+    ) -> Result<u32, Error> {
+        let address = AudioObjectPropertyAddress {
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut value = 0u32;
+        let mut size = size_of::<u32>() as u32;
+        // SAFETY: each scalar selector used here returns one UInt32.
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                object,
+                NonNull::from(&address),
+                0,
+                null(),
+                NonNull::from(&mut size),
+                NonNull::from(&mut value).cast(),
+            )
+        };
+        check_os_status(status)?;
+        Ok(value)
+    }
+    let device_frames: u32 = property(
+        device_id,
+        kAudioDevicePropertyLatency,
+        kAudioObjectPropertyScopeOutput,
+    )?;
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut size = 0;
+    // Query the whole list: devices may have more than one output stream.
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            device_id,
+            NonNull::from(&address),
+            0,
+            null(),
+            NonNull::from(&mut size),
+        )
+    };
+    check_os_status(status)?;
+    let mut streams = vec![0 as AudioStreamID; size as usize / size_of::<AudioStreamID>()];
+    if streams.is_empty() || size as usize % size_of::<AudioStreamID>() != 0 {
+        return Err(Error::with_message(
+            ErrorKind::BackendError,
+            "Invalid output stream list",
+        ));
+    }
+    // SAFETY: the initialized, correctly aligned allocation has the queried size.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            NonNull::from(&address),
+            0,
+            null(),
+            NonNull::from(&mut size),
+            NonNull::new(streams.as_mut_ptr()).unwrap().cast(),
+        )
+    };
+    check_os_status(status)?;
+    let stream = streams[0];
+    let stream_frames: u32 = property(
+        stream,
+        kAudioStreamPropertyLatency,
+        kAudioObjectPropertyScopeGlobal,
+    )?;
+    let unit_seconds: f64 =
+        audio_unit.get_property(kAudioUnitProperty_Latency, Scope::Global, Element::Output)?;
+    let unit_latency = Duration::try_from_secs_f64(unit_seconds).map_err(|_| {
+        Error::with_message(ErrorKind::BackendError, "Invalid AudioUnit output latency")
+    })?;
+    let frames = u64::from(device_frames) + u64::from(stream_frames);
+    Ok(Duration::from_secs_f64(frames as f64 / f64::from(sample_rate)) + unit_latency)
 }
 
 impl PartialEq for Device {

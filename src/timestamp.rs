@@ -1,5 +1,114 @@
 use std::time::Duration;
 
+// CoreAudio's render timestamp and the callback's current host time have
+// different meanings. Kept platform-independent for deterministic validation.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn coreaudio_output_callback_info(
+    callback_now: StreamInstant,
+    render_time: Option<StreamInstant>,
+    hardware_latency: Option<Duration>,
+    buffer_frames: u32,
+) -> OutputCallbackInfo {
+    let presentation = render_time
+        .zip(hardware_latency)
+        .and_then(|(time, latency)| time.checked_add(latency));
+    let usable = presentation.filter(|time| *time >= callback_now);
+    let fallback_reason = if render_time.is_none() || hardware_latency.is_none() {
+        Some(OutputTimestampFallbackReason::Unavailable)
+    } else if usable.is_none() {
+        Some(OutputTimestampFallbackReason::Invalid)
+    } else {
+        None
+    };
+    OutputCallbackInfo {
+        timestamp: OutputStreamTimestamp {
+            callback: callback_now,
+            playback: usable.unwrap_or(callback_now),
+        },
+        timestamp_source: if usable.is_some() {
+            OutputTimestampSource::DevicePresentation
+        } else {
+            OutputTimestampSource::MonotonicFallback
+        },
+        timestamp_diagnostics: Some(OutputTimestampDiagnostics {
+            fallback_reason,
+            output_buffer_size_frames: Some(buffer_frames),
+            ..Default::default()
+        }),
+    }
+}
+
+#[cfg(test)]
+mod coreaudio_output_tests {
+    use super::*;
+
+    #[test]
+    fn coreaudio_output_tracks_host_presentation_across_buffer_changes() {
+        let now = StreamInstant::from_nanos(10_000_000_000);
+        // Device latency is separate from the IO-cycle lead already in host time.
+        for (frames, host_lead) in [(512, 12_000_000), (2048, 46_000_000)] {
+            let render = now + Duration::from_nanos(host_lead);
+            let info = coreaudio_output_callback_info(
+                now,
+                Some(render),
+                Some(Duration::from_millis(2)),
+                frames,
+            );
+            assert_eq!(info.timestamp().callback, now);
+            assert_eq!(info.timestamp().playback, render + Duration::from_millis(2));
+            assert_eq!(
+                info.timestamp_source(),
+                OutputTimestampSource::DevicePresentation
+            );
+            assert_eq!(
+                info.timestamp_diagnostics()
+                    .unwrap()
+                    .output_buffer_size_frames,
+                Some(frames)
+            );
+        }
+    }
+
+    #[test]
+    fn coreaudio_output_unusable_host_time_is_explicit_fallback() {
+        let now = StreamInstant::from_nanos(10_000_000_000);
+        for (render, latency, reason) in [
+            (
+                None,
+                Some(Duration::from_millis(2)),
+                OutputTimestampFallbackReason::Unavailable,
+            ),
+            (
+                Some(now - Duration::from_millis(10)),
+                Some(Duration::from_millis(2)),
+                OutputTimestampFallbackReason::Invalid,
+            ),
+            (
+                Some(now + Duration::from_millis(46)),
+                None,
+                OutputTimestampFallbackReason::Unavailable,
+            ),
+        ] {
+            let info = coreaudio_output_callback_info(now, render, latency, 2048);
+            assert_eq!(
+                info.timestamp(),
+                OutputStreamTimestamp {
+                    callback: now,
+                    playback: now
+                }
+            );
+            assert_eq!(
+                info.timestamp_source(),
+                OutputTimestampSource::MonotonicFallback
+            );
+            assert_eq!(
+                info.timestamp_diagnostics().unwrap().fallback_reason,
+                Some(reason)
+            );
+        }
+    }
+}
+
 /// A monotonic time instance associated with a stream, retrieved from either:
 ///
 /// 1. A timestamp provided to the stream's underlying audio data callback or

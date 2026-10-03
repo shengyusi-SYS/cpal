@@ -414,6 +414,93 @@ impl DeviceTrait for Device {
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(Error) + Send + 'static,
     {
+        self.build_output_stream_raw_with_budget(
+            config,
+            None,
+            sample_format,
+            data_callback,
+            error_callback,
+            timeout,
+        )
+    }
+
+    fn description(&self) -> Result<DeviceDescription, Error> {
+        let (name, description, direction) = match self {
+            Device::Sink { info, .. } => (&info.name, &info.description, DeviceDirection::Output),
+            Device::Source { info, .. } => (&info.name, &info.description, DeviceDirection::Input),
+        };
+
+        let mut builder = DeviceDescriptionBuilder::new(String::from_utf8_lossy(name.as_bytes()))
+            .direction(direction);
+        if let Some(desc) = description {
+            builder = builder.add_extended_line(String::from_utf8_lossy(desc.as_bytes()));
+        }
+
+        Ok(builder.build())
+    }
+
+    fn id(&self) -> Result<DeviceId, Error> {
+        let id = match self {
+            Device::Sink { info, .. } => info.index,
+            Device::Source { info, .. } => info.index,
+        };
+
+        Ok(DeviceId::new(HostId::PulseAudio, id.to_string()))
+    }
+}
+
+impl Device {
+    /// Build a playback stream with a bounded per-stream server queue, leaving
+    /// the sink's hardware latency unchanged (`adjust_latency = false`).
+    ///
+    /// `period_frames` replaces `config.buffer_size` for this stream: the target
+    /// and maximum queue hold two periods, and the minimum request is one period.
+    /// PulseAudio may negotiate these attributes. This is not an exact callback
+    /// size or a bound on consecutive callbacks; inspect/validate actual service
+    /// behavior on the target server. The ordinary DeviceTrait builder retains
+    /// its Default and Fixed behavior.
+    pub fn build_output_stream_with_buffer_budget<T, D, E>(
+        &self,
+        config: StreamConfig,
+        period_frames: FrameCount,
+        mut data_callback: D,
+        error_callback: E,
+        timeout: Option<Duration>,
+    ) -> Result<Stream, Error>
+    where
+        T: crate::SizedSample,
+        D: FnMut(&mut [T], &OutputCallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        self.build_output_stream_raw_with_budget(
+            config,
+            Some(period_frames),
+            T::FORMAT,
+            move |data, info| {
+                data_callback(
+                    data.as_slice_mut()
+                        .expect("host supplied incorrect sample type"),
+                    info,
+                )
+            },
+            error_callback,
+            timeout,
+        )
+    }
+
+    fn build_output_stream_raw_with_budget<D, E>(
+        &self,
+        config: StreamConfig,
+        period_frames: Option<FrameCount>,
+        sample_format: SampleFormat,
+        data_callback: D,
+        error_callback: E,
+        timeout: Option<Duration>,
+    ) -> Result<Stream, Error>
+    where
+        D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
         let Device::Sink { client, info } = self else {
             return Err(Error::with_message(
                 ErrorKind::UnsupportedOperation,
@@ -430,7 +517,10 @@ impl DeviceTrait for Device {
             )
         })?;
 
-        if let BufferSize::Fixed(frame_count) = config.buffer_size {
+        if let Some(frame_count) = period_frames.or(match config.buffer_size {
+            BufferSize::Fixed(frames) => Some(frames),
+            BufferSize::Default => None,
+        }) {
             let bytes_per_frame = config.channels as usize * sample_format.sample_size();
             // Playback uses a double-buffer (max_length = 2 × frame_count × bytes_per_frame),
             // so the max period that fits in MAX_MEMBLOCKQ_LENGTH is halved.
@@ -447,8 +537,7 @@ impl DeviceTrait for Device {
 
         let sample_spec = make_sample_spec(config, format);
         let channel_map = make_channel_map(config);
-        let buffer_attr = make_playback_buffer_attr(config, format);
-        let adjust_latency = matches!(config.buffer_size, BufferSize::Fixed(_));
+        let (buffer_attr, adjust_latency) = playback_buffer_settings(config, format, period_frames);
 
         let params = protocol::PlaybackStreamParams {
             sink_index: Some(info.index),
@@ -492,30 +581,6 @@ impl DeviceTrait for Device {
         }?;
         stream.signal_ready();
         Ok(stream)
-    }
-
-    fn description(&self) -> Result<DeviceDescription, Error> {
-        let (name, description, direction) = match self {
-            Device::Sink { info, .. } => (&info.name, &info.description, DeviceDirection::Output),
-            Device::Source { info, .. } => (&info.name, &info.description, DeviceDirection::Input),
-        };
-
-        let mut builder = DeviceDescriptionBuilder::new(String::from_utf8_lossy(name.as_bytes()))
-            .direction(direction);
-        if let Some(desc) = description {
-            builder = builder.add_extended_line(String::from_utf8_lossy(desc.as_bytes()));
-        }
-
-        Ok(builder.build())
-    }
-
-    fn id(&self) -> Result<DeviceId, Error> {
-        let id = match self {
-            Device::Sink { info, .. } => info.index,
-            Device::Source { info, .. } => info.index,
-        };
-
-        Ok(DeviceId::new(HostId::PulseAudio, id.to_string()))
     }
 }
 
@@ -603,6 +668,22 @@ fn make_channel_map(config: StreamConfig) -> protocol::ChannelMap {
     protocol::ChannelMap::new(aux.iter().copied().take(config.channels as usize))
 }
 
+// A stream-local request budget is independent of sink hardware latency.
+fn playback_buffer_settings(
+    config: StreamConfig,
+    format: protocol::SampleFormat,
+    period_frames: Option<FrameCount>,
+) -> (protocol::stream::BufferAttr, bool) {
+    let bounded = period_frames.map(|frames| StreamConfig {
+        buffer_size: BufferSize::Fixed(frames),
+        ..config
+    });
+    (
+        make_playback_buffer_attr(bounded.unwrap_or(config), format),
+        period_frames.is_none() && matches!(config.buffer_size, BufferSize::Fixed(_)),
+    )
+}
+
 fn make_playback_buffer_attr(
     config: StreamConfig,
     format: protocol::SampleFormat,
@@ -617,8 +698,8 @@ fn make_playback_buffer_attr(
             protocol::stream::BufferAttr {
                 // Double-buffer: total buffer = 2 callback periods. With
                 // adjust_latency this becomes the end-to-end latency target,
-                // Minimum request = one callback period, ensuring the server
-                // always asks for exactly frame_count frames per call.
+                // The minimum request is one period, not an exact callback
+                // size: initial prefill may request both periods at once.
                 max_length: double_len,
                 target_length: double_len,
                 minimum_request_length: len,
@@ -674,6 +755,50 @@ impl Hash for Device {
         match self {
             Device::Sink { info, .. } => info.index.hash(state),
             Device::Source { info, .. } => info.index.hash(state),
+        }
+    }
+}
+
+#[cfg(test)]
+mod playback_budget_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_pulse_default_and_fixed_keep_their_buffer_contracts() {
+        for (buffer_size, max_length, minimum_request_length, adjust) in [
+            (BufferSize::Default, u32::MAX, u32::MAX, false),
+            (BufferSize::Fixed(960), 15_360, 7_680, true),
+        ] {
+            let (attr, adjust_latency) = playback_buffer_settings(
+                StreamConfig {
+                    channels: 2,
+                    sample_rate: 48_000,
+                    buffer_size,
+                },
+                protocol::SampleFormat::Float32Le,
+                None,
+            );
+            assert_eq!(attr.max_length, max_length);
+            assert_eq!(attr.target_length, max_length);
+            assert_eq!(attr.minimum_request_length, minimum_request_length);
+            assert_eq!(adjust_latency, adjust);
+        }
+    }
+
+    #[test]
+    fn pulse_playback_budget_limits_prefill_without_adjusting_sink_latency() {
+        for (rate, period, bytes) in [(44_100, 882, 7_056), (48_000, 960, 7_680)] {
+            let config = StreamConfig {
+                channels: 2,
+                sample_rate: rate,
+                buffer_size: BufferSize::Default,
+            };
+            let (attr, adjust_latency) =
+                playback_buffer_settings(config, protocol::SampleFormat::Float32Le, Some(period));
+            assert_eq!(attr.max_length, bytes * 2);
+            assert_eq!(attr.target_length, bytes * 2);
+            assert_eq!(attr.minimum_request_length, bytes);
+            assert!(!adjust_latency);
         }
     }
 }
