@@ -778,6 +778,19 @@ impl Hash for Device {
 }
 
 impl StreamTrait for Stream {
+    fn actual_output_device_id(&self) -> Result<Option<DeviceId>, Error> {
+        if self.direction != DeviceDirection::Output {
+            return Ok(None);
+        }
+        let stream = self.inner.lock().map_err(|_| {
+            Error::with_message(ErrorKind::StreamInvalidated, "Stream lock poisoned")
+        })?;
+        Ok(
+            super::aaudio_device_id::actual_device_id(stream.device_id())
+                .map(|id| DeviceId::new(crate::platform::HostId::AAudio, id)),
+        )
+    }
+
     fn play(&self) -> Result<(), Error> {
         let stream = self.inner.lock().map_err(|_| {
             Error::with_message(ErrorKind::StreamInvalidated, "Stream lock poisoned")

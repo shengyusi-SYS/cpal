@@ -246,3 +246,7 @@ pub(crate) fn frames_to_duration(
     let nanos = rem_frames * 1_000_000_000 / rate;
     std::time::Duration::new(secs, nanos as u32)
 }
+
+// Pure AAudio ID normalization is also checked on desktop without a device.
+#[cfg(any(target_os = "android", test))]
+mod aaudio_device_id;

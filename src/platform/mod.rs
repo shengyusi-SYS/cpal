@@ -585,6 +585,15 @@ macro_rules! impl_platform_host {
         }
 
         impl crate::traits::StreamTrait for Stream {
+            fn actual_output_device_id(&self) -> Result<Option<crate::DeviceId>, crate::Error> {
+                match self.0 {
+                    $(
+                        $(#[cfg($feat)])?
+                        StreamInner::$HostVariant(ref s) => s.actual_output_device_id(),
+                    )*
+                }
+            }
+
             fn play(&self) -> Result<(), crate::Error> {
                 match self.0 {
                     $(

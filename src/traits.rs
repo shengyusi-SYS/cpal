@@ -411,6 +411,18 @@ pub trait DeviceTrait: PartialEq + Eq + Hash + Debug + Display {
 
 /// A stream created from [`Device`](DeviceTrait), with methods to control it.
 pub trait StreamTrait {
+    /// Query the actual device selected for this opened output stream.
+    ///
+    /// This is a point-in-time observation, not the requested builder device or
+    /// a guarantee about a later callback. Unsupported backends, input streams,
+    /// and unavailable device identities return `Ok(None)`. Backend query
+    /// failures return an error. Call outside audio callbacks: a backend may lock.
+    /// Android AAudio can query this after open, before starting playback; on
+    /// multi-device routes its API reports the first device only.
+    fn actual_output_device_id(&self) -> Result<Option<DeviceId>, Error> {
+        Ok(None)
+    }
+
     /// Start the stream.
     ///
     /// Streams returned by `build_*_stream` are always stopped, so `play` must be called before the
@@ -518,4 +530,32 @@ macro_rules! assert_stream_sync {
         const fn _assert_stream_sync<T: Sync>() {}
         const _: () = _assert_stream_sync::<$t>();
     };
+}
+
+#[cfg(test)]
+mod output_route_tests {
+    use super::*;
+
+    // Minimal backend implements the existing required methods. The SUT is
+    // StreamTrait's default observation, not an audio device or fake route.
+    struct UnsupportedStream;
+    impl StreamTrait for UnsupportedStream {
+        fn play(&self) -> Result<(), Error> {
+            panic!("observation must not start audio")
+        }
+        fn pause(&self) -> Result<(), Error> {
+            panic!("observation must not pause audio")
+        }
+        fn buffer_size(&self) -> Result<crate::FrameCount, Error> {
+            unreachable!()
+        }
+        fn now(&self) -> StreamInstant {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn output_route_observation_unsupported_backend_is_unknown() {
+        assert_eq!(UnsupportedStream.actual_output_device_id().unwrap(), None);
+    }
 }
